@@ -81,13 +81,12 @@ function ThinkDots() {
 export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carriedStars, onFinish, onHome }: Props) {
   const level = LEVELS[levelIndex];
   const questions = useMemo<Question[]>(() => shuffle(level.questions), [level]);
-  // 1P: both robots answer all 10 questions → up to 20 damage; 2P: alternate turns → up to 10
+  // In both modes, the first correct answer wins each question.
   const maxHp = mode === 1 ? 20 : 10;
 
   /* ---------- render state ---------- */
   const [phase, setPhase] = useState<Phase>('intro');
   const [qIndex, setQIndex] = useState(0);
-  const [turn, setTurn] = useState<Side>(0);
   const [hp, setHp] = useState<Pair<number>>([maxHp, maxHp]);
   const [correct, setCorrect] = useState<Pair<number>>([0, 0]);
   const [fstate, setFstate] = useState<Pair<FighterState>>(['idle', 'idle']);
@@ -95,10 +94,11 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
   const [flash, setFlash] = useState<string | null>(null);
   const [shake, setShake] = useState(false);
   const [msg, setMsg] = useState<Msg | null>(null);
-  const [humanChoice, setHumanChoice] = useState<number | null>(null);
-  const [humanDone, setHumanDone] = useState(false);
+  const [playerChoices, setPlayerChoices] = useState<Pair<number | null>>([null, null]);
   const [cpuChoice, setCpuChoice] = useState<number | null>(null);
   const [cpuDone, setCpuDone] = useState(false);
+  const [winnerSide, setWinnerSide] = useState<Side | null>(null);
+  const [answerLocked, setAnswerLocked] = useState(false);
   const [timeLeft, setTimeLeft] = useState(timeLimit);
 
   /* ---------- mutable game state (safe inside timers) ---------- */
@@ -109,12 +109,13 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     hp: [maxHp, maxHp] as Pair<number>,
     correct: [0, 0] as Pair<number>,
     q: 0,
-    turn: 0 as Side,
     queue: [] as Action[],
     busy: false,
     roundActive: false,
     advancing: false,
-    humanDone: false,
+    winnerLocked: false,
+    winner: null as Side | null,
+    roundResolved: false,
     cpuDone: false,
     timerOn: false,
     deadline: 0,
@@ -165,10 +166,7 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     return { x1: x1 - arena.left, y1: y1 - arena.top, x2: x2 - arena.left, y2: y2 - arena.top, color: ra.laser, big, id: Date.now() };
   };
 
-  const roundDone = () => {
-    const s = g.current;
-    return mode === 1 ? s.humanDone && s.cpuDone : s.humanDone;
-  };
+  const roundDone = () => g.current.roundResolved;
 
   /* ---------- action queue: animations play one after another ---------- */
   const runNext = () => {
@@ -176,7 +174,7 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     if (s.busy || s.ended) return;
     const a = s.queue.shift();
     if (!a) {
-      if (s.roundActive && roundDone() && !s.advancing) {
+      if (roundDone() && !s.advancing) {
         s.advancing = true;
         s.roundActive = false;
         later(nextQuestion, 450);
@@ -240,29 +238,47 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
   /* ---------- opponent robot (1-player) ---------- */
   const cpuAnswer = () => {
     const s = g.current;
-    if (!s.roundActive || s.cpuDone || s.ended) return;
+    if (!s.roundActive || s.cpuDone || s.winnerLocked || s.ended) return;
     s.cpuDone = true;
     setCpuDone(true);
     const q = questions[s.q];
     const ok = Math.random() < CPU_ACCURACY[levelIndex];
     const wrongs = [0, 1, 2].filter((x) => x !== q.answer);
-    setCpuChoice(ok ? q.answer : wrongs[Math.floor(Math.random() * wrongs.length)]);
+    const choice = ok ? q.answer : wrongs[Math.floor(Math.random() * wrongs.length)];
+    setCpuChoice(choice);
+    if (ok) {
+      s.winnerLocked = true;
+      s.winner = 1;
+      s.roundResolved = true;
+      s.roundActive = false;
+      s.timerOn = false;
+      setAnswerLocked(true);
+      setWinnerSide(1);
+    }
     enqueue({ actor: 1, kind: ok ? 'correct' : 'wrong' });
+    if (!ok && s.deadline <= Date.now()) {
+      s.roundResolved = true;
+      s.roundActive = false;
+      s.timerOn = false;
+    }
   };
 
   const startRound = () => {
     const s = g.current;
     if (s.ended) return;
     s.queue = [];
-    s.humanDone = false;
     s.cpuDone = false;
+    s.winnerLocked = false;
+    s.winner = null;
+    s.roundResolved = false;
     s.advancing = false;
     s.roundActive = true;
     s.lastTick = -1;
-    setHumanDone(false);
     setCpuDone(false);
-    setHumanChoice(null);
+    setPlayerChoices([null, null]);
     setCpuChoice(null);
+    setWinnerSide(null);
+    setAnswerLocked(false);
     s.deadline = Date.now() + timeLimit * 1000;
     s.timerOn = true;
     setTimeLeft(timeLimit);
@@ -281,10 +297,7 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     if (s.q + 1 < questions.length) {
       s.q += 1;
       setQIndex(s.q);
-      if (mode === 2) {
-        s.turn = other(s.turn);
-        setTurn(s.turn);
-      }
+      // Both human players race on the same question in 2-player mode.
       startRound();
     } else {
       finish();
@@ -352,14 +365,17 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     }
     if (left <= 0) {
       s.timerOn = false;
-      if (!s.humanDone) {
-        s.humanDone = true;
-        setHumanDone(true);
-        enqueue({ actor: mode === 1 ? 0 : s.turn, kind: 'timeout' });
-      }
-      if (mode === 1 && !s.cpuDone) {
+      if (mode === 1 && !s.cpuDone && !s.winnerLocked) {
         clearTimeout(s.cpuTimer);
         cpuAnswer();
+      }
+      // If neither side answered correctly before time expired, resolve the question.
+      if (!s.winnerLocked) {
+        s.roundResolved = true;
+        s.roundActive = false;
+        setAnswerLocked(true);
+        enqueue({ actor: 0, kind: 'timeout' });
+        if (mode === 2) enqueue({ actor: 1, kind: 'timeout' });
       }
     }
   };
@@ -383,65 +399,57 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---------- human answer ---------- */
-  const answer = (i: number) => {
+  /* ---------- first-correct-answer wins ---------- */
+  const answer = (side: Side, optionIndex: number) => {
     const s = g.current;
 
-    // Ignore clicks when the round is inactive or the player has already answered.
-    if (!s.roundActive || s.humanDone || s.ended) return;
+    // Ref-based lock is synchronous: rapid/double clicks cannot claim the same question.
+    if (!s.roundActive || s.winnerLocked || s.roundResolved || s.ended || !s.timerOn) return;
 
-    const q = questions[s.q];
-    const isCorrect = i === q.answer;
-
-    s.humanDone = true;
-    s.timerOn = false;
-    setHumanDone(true);
-    setHumanChoice(i);
-
-    // Record the player's answer.
-    enqueue({
-      actor: mode === 1 ? 0 : s.turn,
-      kind: isCorrect ? 'correct' : 'wrong',
+    const question = questions[s.q];
+    setPlayerChoices((prev) => {
+      const next = [...prev] as Pair<number | null>;
+      next[side] = optionIndex;
+      return next;
     });
 
-    if (mode === 1 && !s.cpuDone) {
-      if (isCorrect) {
-        // Player answered correctly first: cancel the opponent's pending answer
-        // and mark the opponent as done so this question can advance normally.
-        clearTimeout(s.cpuTimer);
-        s.cpuDone = true;
-        setCpuDone(true);
-      } else {
-        // If the player is wrong, the opponent still gets a chance to answer.
-        const remaining = s.cpuDue - Date.now();
-        const quick = 900 + Math.random() * 1300;
-
-        if (remaining > quick) {
-          clearTimeout(s.cpuTimer);
-          s.cpuDue = Date.now() + quick;
-          s.cpuTimer = later(cpuAnswer, quick);
-        }
-      }
+    if (optionIndex !== question.answer) {
+      // A wrong attempt does not lock the question; the same player can try again.
+      enqueue({ actor: side, kind: 'wrong' });
+      return;
     }
+
+    s.winnerLocked = true;
+    s.winner = side;
+    s.roundResolved = true;
+    s.roundActive = false;
+    s.timerOn = false;
+    s.cpuDone = true;
+    clearTimeout(s.cpuTimer);
+
+    setWinnerSide(side);
+    setAnswerLocked(true);
+    setCpuDone(true);
+    enqueue({ actor: side, kind: 'correct' });
   };
 
   /* ---------- derived UI values ---------- */
   const q = questions[qIndex];
-  const revealed = humanDone;
-  const roundComplete = mode === 1 ? humanDone && cpuDone : humanDone;
+  const revealed = answerLocked;
+  const roundComplete = answerLocked;
   const progress = phase === 'finish' ? 100 : ((qIndex + (roundComplete ? 1 : 0)) / questions.length) * 100;
   const stars: Pair<number> = [carriedStars[0] + correct[0] * 10, carriedStars[1] + correct[1] * 10];
   const labels = mode === 1 ? ['PEMAIN', 'LAWAN'] : ['PEMAIN 1', 'PEMAIN 2'];
   const secs = Math.ceil(timeLeft);
   const frac = Math.max(0, Math.min(1, timeLeft / timeLimit));
-  const urgent = secs <= 5 && !humanDone && phase === 'play';
+  const urgent = secs <= 5 && !answerLocked && phase === 'play';
   const timerColor = secs <= 5 ? 'bg-red-500' : secs <= 10 ? 'bg-orange-500' : 'bg-green-500';
   const playing = phase === 'play';
 
   const statusFor = (side: Side): ReactNode => {
     if (!playing) return null;
     if (mode === 1) {
-      if (side === 0) return humanDone ? <Bubble tone="done">✔ Sudah jawab</Bubble> : <Bubble tone="turn">🎯 Ayo jawab!</Bubble>;
+      if (side === 0) return answerLocked && winnerSide === 0 ? <Bubble tone="done">🏆 Menang cepat!</Bubble> : <Bubble tone="turn">🎯 Ayo jawab!</Bubble>;
       return cpuDone ? (
         <Bubble tone="done">✔ Sudah jawab</Bubble>
       ) : (
@@ -451,9 +459,9 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
         </Bubble>
       );
     }
-    return side === turn && !humanDone ? <Bubble tone="turn">🎯 Giliranmu!</Bubble> : null;
+    return answerLocked && winnerSide === side ? <Bubble tone="done">🏆 Menang cepat!</Bubble> : <Bubble tone="turn">⚡ Jawab cepat!</Bubble>;
   };
-  const activeFor = (side: Side) => playing && (mode === 1 ? (side === 0 ? !humanDone : !cpuDone) : side === turn && !humanDone);
+  const activeFor = (side: Side) => playing && !answerLocked && (mode === 1 ? side === 0 || !cpuDone : true);
 
   return (
     <GameFrame fit>
@@ -544,9 +552,9 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
               {mode === 2 ? (
                 <span
                   className="text-outline shrink-0 whitespace-nowrap rounded-full border-2 border-white px-2.5 py-0.5 text-[10px] font-extrabold text-white sm:text-xs"
-                  style={{ background: robots[turn].color }}
+                  style={{ background: robots[0].color }}
                 >
-                  GILIRAN PEMAIN {turn + 1}
+                  PEMAIN 1 VS PEMAIN 2
                 </span>
               ) : (
                 <span className="shrink-0 whitespace-nowrap text-[10px] font-extrabold text-blue-900 sm:text-xs">🤖 Lawan ikut menjawab!</span>
@@ -570,36 +578,50 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
               <h2 className="q-text flex-1 font-extrabold text-blue-950">{q.q}</h2>
             </div>
 
-            <div className="q-gap mt-[1vh] grid grid-cols-1 short:grid-cols-3">
-              {q.options.map((opt, i) => {
-                const isCorrect = i === q.answer;
-                const isSel = humanChoice === i;
-                const cpuPicked = mode === 1 && revealed && cpuDone && cpuChoice === i;
-                return (
-                  <button
-                    key={i}
-                    disabled={!playing || humanDone}
-                    onClick={() => answer(i)}
-                    className={cn(
-                      'q-opt btn-3d relative flex w-full items-center gap-2 rounded-xl px-2.5 text-left sm:gap-3 sm:rounded-2xl sm:px-4',
-                      revealed && isSel && !isCorrect ? 'btn-red anim-shake' : OPTION_STYLES[i],
-                      revealed && isCorrect && 'anim-pulse-glow',
-                      revealed && !isCorrect && !isSel && 'opacity-55',
-                    )}
-                  >
-                    <span className="q-letter flex shrink-0 items-center justify-center rounded-full border-2 border-white/90 bg-white font-black text-blue-900">
-                      {revealed && isCorrect ? '✓' : revealed && isSel ? '✗' : LETTERS[i]}
-                    </span>
-                    <span className="font-title text-outline leading-tight">{opt}</span>
-                    {cpuPicked && (
-                      <span className="absolute -top-2 right-2 rounded-full border-2 border-white bg-violet-600 px-1.5 text-[10px] font-extrabold leading-4 text-white shadow sm:text-xs">
-                        🤖 LAWAN
+            {mode === 1 ? (
+              <div className="q-gap mt-[1vh] grid grid-cols-1 short:grid-cols-3">
+                {q.options.map((opt, i) => {
+                  const isCorrect = i === q.answer;
+                  const isSel = playerChoices[0] === i;
+                  const cpuPicked = revealed && cpuDone && cpuChoice === i;
+                  return (
+                    <button key={i} disabled={!playing || answerLocked} onClick={() => answer(0, i)}
+                      className={cn('q-opt btn-3d relative flex w-full items-center gap-2 rounded-xl px-2.5 text-left sm:gap-3 sm:rounded-2xl sm:px-4',
+                        revealed && isSel && !isCorrect ? 'btn-red anim-shake' : OPTION_STYLES[i],
+                        revealed && isCorrect && 'anim-pulse-glow', revealed && !isCorrect && !isSel && 'opacity-55')}>
+                      <span className="q-letter flex shrink-0 items-center justify-center rounded-full border-2 border-white/90 bg-white font-black text-blue-900">
+                        {revealed && isCorrect ? '✓' : revealed && isSel ? '✗' : LETTERS[i]}
                       </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+                      <span className="font-title text-outline leading-tight">{opt}</span>
+                      {cpuPicked && <span className="absolute -top-2 right-2 rounded-full border-2 border-white bg-violet-600 px-1.5 text-[10px] font-extrabold leading-4 text-white shadow sm:text-xs">🤖 LAWAN</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="q-gap mt-[1vh] grid grid-cols-2 gap-2">
+                {([0, 1] as Side[]).map((side) => (
+                  <div key={side} className="min-w-0 rounded-xl border-2 border-white/70 bg-white/35 p-2">
+                    <div className="mb-1 text-center text-xs font-extrabold text-blue-950">PEMAIN {side + 1}{winnerSide === side ? ' 🏆 TERCEPAT!' : ''}</div>
+                    <div className="grid grid-cols-1 gap-1">
+                      {q.options.map((opt, i) => {
+                        const isCorrect = i === q.answer;
+                        const isSel = playerChoices[side] === i;
+                        return (
+                          <button key={i} disabled={!playing || answerLocked} onClick={() => answer(side, i)}
+                            className={cn('q-opt btn-3d relative flex w-full items-center gap-2 rounded-xl px-2 text-left sm:gap-2 sm:px-2',
+                              revealed && isSel && !isCorrect ? 'btn-red anim-shake' : OPTION_STYLES[i],
+                              revealed && isCorrect && 'anim-pulse-glow', revealed && !isCorrect && !isSel && 'opacity-55')}>
+                            <span className="q-letter flex shrink-0 items-center justify-center rounded-full border-2 border-white/90 bg-white font-black text-blue-900">{revealed && isCorrect ? '✓' : revealed && isSel ? '✗' : LETTERS[i]}</span>
+                            <span className="font-title text-outline leading-tight">{opt}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -620,7 +642,7 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
               </span>
             </div>
             <div className="credit mt-1 rounded-full px-4 py-1.5 text-xs font-extrabold text-white sm:text-sm">
-              ⏱️ {timeLimit} detik per soal · {mode === 1 ? 'Robot lawan juga ikut menjawab!' : 'Bergantian menjawab!'}
+              ⏱️ {timeLimit} detik per soal · {mode === 1 ? 'Robot lawan juga ikut menjawab!' : 'Siapa paling cepat menjawab benar!'}
             </div>
           </div>
         </div>
