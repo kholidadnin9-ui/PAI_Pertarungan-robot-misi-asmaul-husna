@@ -386,21 +386,41 @@ export default function BattleScreen({ mode, robots, levelIndex, timeLimit, carr
   /* ---------- human answer ---------- */
   const answer = (i: number) => {
     const s = g.current;
+
+    // Ignore clicks when the round is inactive or the player has already answered.
     if (!s.roundActive || s.humanDone || s.ended) return;
+
+    const q = questions[s.q];
+    const isCorrect = i === q.answer;
+
     s.humanDone = true;
     s.timerOn = false;
     setHumanDone(true);
     setHumanChoice(i);
-    const q = questions[s.q];
-    enqueue({ actor: mode === 1 ? 0 : s.turn, kind: i === q.answer ? 'correct' : 'wrong' });
+
+    // Record the player's answer.
+    enqueue({
+      actor: mode === 1 ? 0 : s.turn,
+      kind: isCorrect ? 'correct' : 'wrong',
+    });
+
     if (mode === 1 && !s.cpuDone) {
-      // player already answered → opponent answers soon so nobody waits long
-      const remaining = s.cpuDue - Date.now();
-      const quick = 900 + Math.random() * 1300;
-      if (remaining > quick) {
+      if (isCorrect) {
+        // Player answered correctly first: cancel the opponent's pending answer
+        // and mark the opponent as done so this question can advance normally.
         clearTimeout(s.cpuTimer);
-        s.cpuDue = Date.now() + quick;
-        s.cpuTimer = later(cpuAnswer, quick);
+        s.cpuDone = true;
+        setCpuDone(true);
+      } else {
+        // If the player is wrong, the opponent still gets a chance to answer.
+        const remaining = s.cpuDue - Date.now();
+        const quick = 900 + Math.random() * 1300;
+
+        if (remaining > quick) {
+          clearTimeout(s.cpuTimer);
+          s.cpuDue = Date.now() + quick;
+          s.cpuTimer = later(cpuAnswer, quick);
+        }
       }
     }
   };
